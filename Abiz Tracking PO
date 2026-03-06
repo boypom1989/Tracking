@@ -1,0 +1,410 @@
+<!DOCTYPE html>
+<html lang="th">
+<head>
+    <meta charset="UTF-8">
+    <meta name="viewport" content="width=device-width, initial-scale=1.0">
+    <title>Cloud PO Tracker - Enterprise Edition</title>
+    <script src="https://cdn.tailwindcss.com"></script>
+    <script src="https://cdn.jsdelivr.net/npm/chart.js"></script>
+    <!-- Firebase Libraries -->
+    <script type="module">
+        import { initializeApp } from "https://www.gstatic.com/firebasejs/11.6.1/firebase-app.js";
+        import { getAuth, signInAnonymously, signInWithCustomToken, onAuthStateChanged, GoogleAuthProvider, signInWithPopup, signOut } from "https://www.gstatic.com/firebasejs/11.6.1/firebase-auth.js";
+        import { getFirestore, collection, doc, addDoc, updateDoc, deleteDoc, onSnapshot, query } from "https://www.gstatic.com/firebasejs/11.6.1/firebase-firestore.js";
+
+        // --- Configuration ---
+        const firebaseConfig = JSON.parse(__firebase_config);
+        const app = initializeApp(firebaseConfig);
+        const auth = getAuth(app);
+        const db = getFirestore(app);
+        const appId = typeof __app_id !== 'undefined' ? __app_id : 'po-tracker-enterprise';
+        const googleProvider = new GoogleAuthProvider();
+
+        // UI State
+        let poData = [];
+        let statusChartInstance = null;
+        let currentUser = null;
+        let editingId = null;
+
+        // --- Auth Operations ---
+        window.loginWithGoogle = async () => {
+            try {
+                await signInWithPopup(auth, googleProvider);
+                showToast("เข้าสู่ระบบสำเร็จ", "success");
+            } catch (error) {
+                showToast("การเข้าสู่ระบบผิดพลาด: " + error.message, "error");
+            }
+        };
+
+        window.logout = async () => {
+            await signOut(auth);
+            location.reload();
+        };
+
+        const initAuth = async () => {
+            if (typeof __initial_auth_token !== 'undefined' && __initial_auth_token) {
+                await signInWithCustomToken(auth, __initial_auth_token);
+            }
+            // If no token, the UI will show Login screen via onAuthStateChanged
+        };
+
+        onAuthStateChanged(auth, (user) => {
+            currentUser = user;
+            const loginScreen = document.getElementById('login-screen');
+            const mainApp = document.getElementById('main-app');
+            
+            if (user) {
+                loginScreen.classList.add('hidden');
+                mainApp.classList.remove('hidden');
+                document.getElementById('user-name').innerText = user.displayName || "User";
+                if(user.photoURL) document.getElementById('user-img').src = user.photoURL;
+                setupRealtimeSync();
+            } else {
+                loginScreen.classList.remove('hidden');
+                mainApp.classList.add('hidden');
+            }
+        });
+
+        initAuth();
+
+        // --- Firestore Real-time Sync ---
+        const ordersCollection = collection(db, 'artifacts', appId, 'public', 'data', 'orders');
+
+        function setupRealtimeSync() {
+            if (!currentUser) return;
+            onSnapshot(ordersCollection, (snapshot) => {
+                poData = snapshot.docs.map(doc => ({ id: doc.id, ...doc.data() }));
+                refreshUI();
+            }, (error) => {
+                showToast("ดึงข้อมูลไม่สำเร็จ: " + error.message, "error");
+            });
+        }
+
+        // --- Export to Google Sheets (CSV) ---
+        window.exportToCSV = () => {
+            if (poData.length === 0) {
+                showToast("ไม่มีข้อมูลให้ Export", "error");
+                return;
+            }
+
+            const headers = ["Date Received", "PO Number", "Customer", "ETD Date", "Status", "Amount (THB)"];
+            const rows = poData.map(po => [
+                po.date,
+                po.poNumber,
+                `"${po.customer.replace(/"/g, '""')}"`, // Handle commas in customer name
+                po.etd,
+                po.status,
+                po.amount
+            ]);
+
+            let csvContent = "\uFEFF"; // Add BOM for Excel Thai support
+            csvContent += headers.join(",") + "\n";
+            rows.forEach(row => {
+                csvContent += row.join(",") + "\n";
+            });
+
+            const blob = new Blob([csvContent], { type: 'text/csv;charset=utf-8;' });
+            const link = document.createElement("a");
+            const url = URL.createObjectURL(blob);
+            link.setAttribute("href", url);
+            link.setAttribute("download", `PO_Report_${new Date().toISOString().split('T')[0]}.csv`);
+            link.style.visibility = 'hidden';
+            document.body.appendChild(link);
+            link.click();
+            document.body.removeChild(link);
+            showToast("ส่งออกไฟล์สำเร็จ", "success");
+        };
+
+        // --- CRUD Operations ---
+        window.handleFormSubmit = async (e) => {
+            e.preventDefault();
+            if (!currentUser) return;
+
+            const formData = {
+                date: document.getElementById('input-date').value,
+                poNumber: document.getElementById('input-id').value,
+                customer: document.getElementById('input-customer').value,
+                etd: document.getElementById('input-etd').value,
+                status: document.getElementById('input-status').value,
+                amount: parseFloat(document.getElementById('input-amount').value || 0),
+                updatedAt: new Date().toISOString(),
+                createdBy: currentUser.email
+            };
+
+            try {
+                if (editingId) {
+                    await updateDoc(doc(db, 'artifacts', appId, 'public', 'data', 'orders', editingId), formData);
+                    showToast("อัปเดตข้อมูลแล้ว", "success");
+                    cancelEdit();
+                } else {
+                    await addDoc(ordersCollection, formData);
+                    showToast("บันทึกข้อมูลแล้ว", "success");
+                }
+                e.target.reset();
+            } catch (error) {
+                showToast("ผิดพลาด: " + error.message, "error");
+            }
+        };
+
+        window.startEdit = (id) => {
+            const item = poData.find(d => d.id === id);
+            if (!item) return;
+            editingId = id;
+            document.getElementById('input-date').value = item.date;
+            document.getElementById('input-id').value = item.poNumber;
+            document.getElementById('input-customer').value = item.customer;
+            document.getElementById('input-etd').value = item.etd;
+            document.getElementById('input-status').value = item.status;
+            document.getElementById('input-amount').value = item.amount;
+            document.getElementById('form-title').innerText = "แก้ไขข้อมูลรายการ";
+            document.getElementById('submit-btn').innerText = "Save Changes";
+            document.getElementById('cancel-edit-btn').classList.remove('hidden');
+            window.scrollTo({ top: 0, behavior: 'smooth' });
+        };
+
+        window.cancelEdit = () => {
+            editingId = null;
+            document.getElementById('po-form').reset();
+            document.getElementById('form-title').innerText = "เพิ่มคำสั่งซื้อใหม่";
+            document.getElementById('submit-btn').innerText = "+ Add Order";
+            document.getElementById('cancel-edit-btn').classList.add('hidden');
+        };
+
+        window.deleteOrder = async (id) => {
+            if (confirm("ยืนยันการลบรายการนี้?")) {
+                await deleteDoc(doc(db, 'artifacts', appId, 'public', 'data', 'orders', id));
+                showToast("ลบข้อมูลแล้ว", "success");
+            }
+        };
+
+        // --- UI Rendering ---
+        function refreshUI() {
+            const active = poData.filter(d => d.status === 'Pending' || d.status === 'Processing').length;
+            const revenue = poData.filter(d => d.status === 'Shipped').reduce((a, b) => a + b.amount, 0);
+            
+            document.getElementById('stat-active').innerText = active;
+            document.getElementById('stat-revenue').innerText = revenue.toLocaleString() + '฿';
+            document.getElementById('total-count').innerText = poData.length;
+
+            renderTable();
+            updateChart();
+        }
+
+        function renderTable() {
+            const tbody = document.getElementById('po-table-body');
+            tbody.innerHTML = '';
+            
+            poData.sort((a,b) => b.updatedAt.localeCompare(a.updatedAt)).forEach(po => {
+                const tr = document.createElement('tr');
+                tr.className = "border-b border-slate-100 hover:bg-slate-50";
+                tr.innerHTML = `
+                    <td class="px-6 py-4 text-sm font-medium text-slate-500">${po.date}</td>
+                    <td class="px-6 py-4 text-sm font-bold text-slate-900">${po.poNumber}</td>
+                    <td class="px-6 py-4 text-sm text-slate-600">${po.customer}</td>
+                    <td class="px-6 py-4 text-sm font-medium">${po.etd}</td>
+                    <td class="px-6 py-4">
+                        <span class="px-2 py-1 rounded-full text-[10px] font-bold uppercase ${getStatusStyle(po.status)}">
+                            ${po.status}
+                        </span>
+                    </td>
+                    <td class="px-6 py-4 text-right flex justify-end space-x-3">
+                        <button onclick="startEdit('${po.id}')" class="text-slate-400 hover:text-blue-600 transition">✏️</button>
+                        <button onclick="deleteOrder('${po.id}')" class="text-slate-400 hover:text-red-600 transition">🗑️</button>
+                    </td>
+                `;
+                tbody.appendChild(tr);
+            });
+        }
+
+        function updateChart() {
+            const ctx = document.getElementById('statusChart').getContext('2d');
+            const counts = {
+                Pending: poData.filter(d => d.status === 'Pending').length,
+                Processing: poData.filter(d => d.status === 'Processing').length,
+                Shipped: poData.filter(d => d.status === 'Shipped').length,
+                Cancelled: poData.filter(d => d.status === 'Cancelled').length
+            };
+
+            if (statusChartInstance) statusChartInstance.destroy();
+            statusChartInstance = new Chart(ctx, {
+                type: 'bar',
+                data: {
+                    labels: Object.keys(counts),
+                    datasets: [{
+                        data: Object.values(counts),
+                        backgroundColor: ['#f59e0b', '#3b82f6', '#10b981', '#ef4444'],
+                        borderRadius: 8
+                    }]
+                },
+                options: { 
+                    responsive: true, 
+                    maintainAspectRatio: false,
+                    plugins: { legend: { display: false } },
+                    scales: { y: { beginAtZero: true, grid: { display: false } }, x: { grid: { display: false } } }
+                }
+            });
+        }
+
+        function getStatusStyle(s) {
+            if (s === 'Pending') return 'bg-amber-100 text-amber-700';
+            if (s === 'Processing') return 'bg-blue-100 text-blue-700';
+            if (s === 'Shipped') return 'bg-emerald-100 text-emerald-700';
+            return 'bg-slate-100 text-slate-700';
+        }
+
+        function showToast(msg, type) {
+            const t = document.createElement('div');
+            t.className = `fixed bottom-6 right-6 px-6 py-3 rounded-xl text-white font-bold z-[100] shadow-lg transition-all ${type === 'success' ? 'bg-emerald-600' : 'bg-slate-900'}`;
+            t.innerText = msg;
+            document.body.appendChild(t);
+            setTimeout(() => { t.style.opacity = '0'; setTimeout(() => t.remove(), 500); }, 3000);
+        }
+    </script>
+    <style>
+        @import url('https://fonts.googleapis.com/css2?family=Sarabun:wght@300;400;600;700&display=swap');
+        body { font-family: 'Sarabun', sans-serif; background-color: #f1f5f9; }
+        .chart-container { position: relative; width: 100%; height: 180px; }
+        .glass-card { background: rgba(255, 255, 255, 0.95); backdrop-filter: blur(10px); }
+    </style>
+</head>
+<body class="text-slate-800">
+
+    <!-- Login Screen -->
+    <div id="login-screen" class="fixed inset-0 bg-slate-900 flex items-center justify-center z-[200] px-4">
+        <div class="max-w-md w-full bg-white rounded-3xl p-10 text-center shadow-2xl">
+            <div class="w-20 h-20 bg-emerald-600 rounded-2xl mx-auto flex items-center justify-center text-4xl mb-6 shadow-lg shadow-emerald-200">📦</div>
+            <h1 class="text-3xl font-bold text-slate-900 mb-2">PO Tracker Cloud</h1>
+            <p class="text-slate-500 mb-10">ระบบติดตามคำสั่งซื้อสำหรับองค์กร กรุณาลงชื่อเข้าใช้เพื่อเริ่มต้น</p>
+            <button onclick="loginWithGoogle()" class="w-full bg-white border-2 border-slate-200 hover:border-emerald-600 transition-all font-bold py-4 rounded-2xl flex items-center justify-center space-x-3 text-slate-700 group">
+                <img src="https://www.gstatic.com/firebasejs/ui/2.0.0/images/action/google.svg" class="w-6 h-6" alt="Google">
+                <span>Sign in with Google</span>
+            </button>
+            <p class="mt-8 text-xs text-slate-400 uppercase tracking-widest font-bold">Secure Cloud Storage</p>
+        </div>
+    </div>
+
+    <!-- Main App Content -->
+    <div id="main-app" class="hidden min-h-screen">
+        <nav class="bg-slate-900 text-white sticky top-0 z-40">
+            <div class="max-w-7xl mx-auto px-4 sm:px-6 lg:px-8 h-16 flex justify-between items-center">
+                <div class="flex items-center space-x-3">
+                    <span class="text-xl font-bold tracking-tight">Cloud<span class="text-emerald-500">PO</span></span>
+                </div>
+                <div class="flex items-center space-x-6">
+                    <button onclick="exportToCSV()" class="bg-emerald-600 hover:bg-emerald-700 text-white text-xs font-bold px-4 py-2 rounded-lg transition-all flex items-center">
+                        <span class="mr-2">📊</span> Export to Sheets
+                    </button>
+                    <div class="flex items-center space-x-3 border-l border-slate-700 pl-6">
+                        <div class="text-right hidden sm:block">
+                            <p id="user-name" class="text-xs font-bold">--</p>
+                            <button onclick="logout()" class="text-[10px] text-slate-400 hover:text-red-400 uppercase font-bold tracking-tighter">Sign Out</button>
+                        </div>
+                        <img id="user-img" src="https://ui-avatars.com/api/?name=User" class="w-9 h-9 rounded-full border-2 border-emerald-500 p-0.5" alt="Avatar">
+                    </div>
+                </div>
+            </div>
+        </nav>
+
+        <main class="max-w-7xl mx-auto px-4 py-8 sm:px-6 lg:px-8">
+            <!-- Dashboard -->
+            <div class="grid grid-cols-1 lg:grid-cols-4 gap-6 mb-8">
+                <div class="lg:col-span-1 grid grid-cols-1 gap-4">
+                    <div class="bg-white p-6 rounded-2xl shadow-sm border border-slate-200">
+                        <p class="text-[10px] font-bold text-slate-400 uppercase tracking-wider mb-2">Active Jobs</p>
+                        <h3 id="stat-active" class="text-3xl font-bold text-blue-600">0</h3>
+                    </div>
+                    <div class="bg-white p-6 rounded-2xl shadow-sm border border-slate-200">
+                        <p class="text-[10px] font-bold text-slate-400 uppercase tracking-wider mb-2">Shipped Revenue</p>
+                        <h3 id="stat-revenue" class="text-3xl font-bold text-emerald-600">0฿</h3>
+                    </div>
+                </div>
+                <div class="lg:col-span-3 bg-white p-6 rounded-2xl shadow-sm border border-slate-200 flex items-center">
+                    <div class="w-full">
+                        <h4 class="text-xs font-bold text-slate-400 uppercase mb-4 text-center">Order Status Distribution</h4>
+                        <div class="chart-container"><canvas id="statusChart"></canvas></div>
+                    </div>
+                </div>
+            </div>
+
+            <!-- Form & Management -->
+            <div class="grid grid-cols-1 xl:grid-cols-3 gap-8">
+                <!-- Form Side -->
+                <div class="xl:col-span-1">
+                    <div class="bg-white p-6 rounded-2xl shadow-sm border border-slate-200 sticky top-24">
+                        <h2 id="form-title" class="text-lg font-bold text-slate-900 mb-6">เพิ่มคำสั่งซื้อใหม่</h2>
+                        <form id="po-form" onsubmit="handleFormSubmit(event)" class="space-y-4">
+                            <div>
+                                <label class="block text-xs font-bold text-slate-500 uppercase mb-1">Received Date</label>
+                                <input type="date" id="input-date" required class="w-full bg-slate-50 border border-slate-200 rounded-xl p-3 text-sm focus:ring-2 focus:ring-emerald-500 outline-none transition-all">
+                            </div>
+                            <div>
+                                <label class="block text-xs font-bold text-slate-500 uppercase mb-1">PO Number</label>
+                                <input type="text" id="input-id" placeholder="Ex. PO-2024-001" required class="w-full bg-slate-50 border border-slate-200 rounded-xl p-3 text-sm focus:ring-2 focus:ring-emerald-500 outline-none transition-all">
+                            </div>
+                            <div>
+                                <label class="block text-xs font-bold text-slate-500 uppercase mb-1">Customer</label>
+                                <input type="text" id="input-customer" placeholder="Client Name" required class="w-full bg-slate-50 border border-slate-200 rounded-xl p-3 text-sm focus:ring-2 focus:ring-emerald-500 outline-none transition-all">
+                            </div>
+                            <div class="grid grid-cols-2 gap-4">
+                                <div>
+                                    <label class="block text-xs font-bold text-slate-500 uppercase mb-1">ETD Date</label>
+                                    <input type="date" id="input-etd" required class="w-full bg-slate-50 border border-slate-200 rounded-xl p-3 text-sm focus:ring-2 focus:ring-emerald-500 outline-none">
+                                </div>
+                                <div>
+                                    <label class="block text-xs font-bold text-slate-500 uppercase mb-1">Amount</label>
+                                    <input type="number" id="input-amount" placeholder="฿฿฿" required class="w-full bg-slate-50 border border-slate-200 rounded-xl p-3 text-sm focus:ring-2 focus:ring-emerald-500 outline-none">
+                                </div>
+                            </div>
+                            <div>
+                                <label class="block text-xs font-bold text-slate-500 uppercase mb-1">Status</label>
+                                <select id="input-status" class="w-full bg-slate-50 border border-slate-200 rounded-xl p-3 text-sm font-bold focus:ring-2 focus:ring-emerald-500 outline-none transition-all">
+                                    <option value="Pending">🟡 Pending</option>
+                                    <option value="Processing">🔵 Processing</option>
+                                    <option value="Shipped">🟢 Shipped</option>
+                                    <option value="Cancelled">🔴 Cancelled</option>
+                                </select>
+                            </div>
+                            <div class="pt-4 space-y-2">
+                                <button type="submit" id="submit-btn" class="w-full bg-slate-900 hover:bg-black text-white font-bold py-4 rounded-xl shadow-lg transition-all">
+                                    + Add Order
+                                </button>
+                                <button type="button" id="cancel-edit-btn" onclick="cancelEdit()" class="hidden w-full bg-slate-100 hover:bg-slate-200 text-slate-600 font-bold py-4 rounded-xl transition-all">
+                                    Cancel Edit
+                                </button>
+                            </div>
+                        </form>
+                    </div>
+                </div>
+
+                <!-- Table Side -->
+                <div class="xl:col-span-2">
+                    <div class="bg-white rounded-2xl shadow-sm border border-slate-200 overflow-hidden">
+                        <div class="px-8 py-6 border-b border-slate-100 flex justify-between items-center bg-white/50">
+                            <h3 class="font-bold text-slate-800">Order Management</h3>
+                            <span class="text-[10px] font-bold text-slate-400 uppercase tracking-widest">Total <span id="total-count" class="text-emerald-600">0</span> Items</span>
+                        </div>
+                        <div class="overflow-x-auto">
+                            <table class="w-full text-left">
+                                <thead>
+                                    <tr class="bg-slate-50/50">
+                                        <th class="px-8 py-4 text-[10px] font-bold text-slate-400 uppercase">Date</th>
+                                        <th class="px-8 py-4 text-[10px] font-bold text-slate-400 uppercase">PO No.</th>
+                                        <th class="px-8 py-4 text-[10px] font-bold text-slate-400 uppercase">Customer</th>
+                                        <th class="px-8 py-4 text-[10px] font-bold text-slate-400 uppercase">ETD</th>
+                                        <th class="px-8 py-4 text-[10px] font-bold text-slate-400 uppercase">Status</th>
+                                        <th class="px-8 py-4 text-[10px] font-bold text-slate-400 uppercase text-right">Actions</th>
+                                    </tr>
+                                </thead>
+                                <tbody id="po-table-body" class="divide-y divide-slate-100">
+                                    <!-- Dynamic Content -->
+                                </tbody>
+                            </table>
+                        </div>
+                    </div>
+                </div>
+            </div>
+        </main>
+    </div>
+
+</body>
+</html>
